@@ -1,49 +1,199 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: loadgenerator
+  name: acmefitness-loadgen
 spec:
   selector:
     matchLabels:
-      app: loadgenerator
+      app: acmefitness-loadgen
   replicas: 1
   template:
     metadata:
       labels:
-        app: loadgenerator
+        app: acmefitness-loadgen
       annotations:
         sidecar.istio.io/inject: "false"
     spec:
       terminationGracePeriodSeconds: 5
-      restartPolicy: Always
-      initContainers:
-      - name: wait-frontend
-        image: alpine:3.7
-        command: ['sh', '-c']
-        args: ['echo -e "http://nl.alpinelinux.org/alpine/v3.5/main\nhttp://nl.alpinelinux.org/alpine/v3.5/community" > /etc/apk/repositories;
-            apk update;
-            apk add curl;
-            until curl -f -m 2 -s -S "${FRONTEND_ADDR}" > /dev/null; do
-              echo "waiting for ${FRONTEND_ADDR}";
-              sleep 2;
-            done;
-            echo "Reached ${FRONTEND_ADDR}."']
-        env:
-        - name: FRONTEND_ADDR
-          value: "http://istio-ingressgateway.istio-system"
       containers:
-      - name: main
-        image: djmcaleese/acmefitness-loadgen:latest
-        imagePullPolicy: Always
-        ports:
-        - containerPort: 8089
-        env:
-        - name: FRONTEND_ADDR
-          value: "http://istio-ingressgateway.istio-system"
+      - name: locust
+        image: locustio/locust:1.5.3
+        command:
+        - locust
+        args: ["-f","/mnt/locust/locustfile.py", "--headless", "--host=http://istio-ingressgateway.istio-system"]
         resources:
           requests:
             cpu: 300m
             memory: 256Mi
           limits:
-            cpu: 500m
+            cpu: 1
             memory: 512Mi
+        volumeMounts:
+        - name: locustfile
+          mountPath: /mnt/locust
+      volumes:
+      - name: locustfile
+        configMap:
+          name: acmefitness-locustfile
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: acmefitness-locustfile
+data:
+  locustfile.py: |
+    # This program will generate traffic for ACME Fitness Shop app. It simulates both
+    # Authenticated and Guest user scenarios. Refer to the "locust" documentation for
+    # further information. 
+
+    import logging
+    import math
+    import random
+    from locust import between, HttpUser, LoadTestShape, SequentialTaskSet, TaskSet, task
+
+
+    # List of users (pre-loaded into ACME Fitness shop)
+    users = ["eric", "phoebe", "dwight", "han"] 
+
+    # List of products within the catalog
+    products = []
+
+
+    # GuestUserBrowsing simulates traffic for a Guest User (Not logged in)
+    class GuestUserBrowsing(SequentialTaskSet):
+
+        def on_start(self):
+            self.getProducts()
+
+        def listCatalogItems(self):
+            items = self.client.get("/products").json()["data"]
+            for item in items:
+                products.append(item["id"])
+            return products
+
+        @task(1)
+        def getProducts(self):
+            logging.info("Guest User - Get Products")
+            self.client.get("/products")
+
+        @task(2)
+        def getProduct(self):
+            logging.info("Guest User - Get a product")
+            products = self.listCatalogItems()
+            product_id = random.choice(products)
+            product = self.client.get("/products/"+ product_id).json()
+            logging.info("Product info - " +  str(product))
+            products.clear()
+
+
+    # AuthUserBrowsing simulates traffic for Authenticated Users (Logged in)
+    class AuthUserBrowsing(SequentialTaskSet):
+
+        def on_start(self):
+            self.login()
+
+        @task(1)
+        def login(self):
+            user = random.choice(users)
+            logging.info("Auth User - Login user " + user)
+            body = self.client.post("/login/", json={"username": user, "password":"vmware1!"}).json()
+            self.user.userid = body["token"]
+
+        @task(1)
+        def getProducts(self):
+            logging.info("Auth User - Get Catalog")
+            self.client.get("/products")
+
+        @task(2)
+        def getProduct(self):
+            logging.info("Auth User - Get a product")
+            products = self.listCatalogItems()
+            product_id = random.choice(products)
+            product = self.client.get("/products/"+ product_id).json()
+            logging.info("Product info - " +  str(product))
+            products.clear()
+
+        @task(2)
+        def addToCart(self):
+            self.listCatalogItems()
+            productid = random.choice(products)
+            logging.info("Add to Cart for user " + self.user.userid)
+            self.client.post("/cart/item/add/" + self.user.userid, json={
+                      "name": productid,
+                      "price": "100",
+                      "shortDescription": "Test add to cart",
+                      "quantity": random.randint(1,2),
+                      "itemid": productid
+                    })
+            products.clear()
+
+        @task(1)
+        def checkout(self):
+            self.client.get("/cart/items/" + self.user.userid).json()
+            self.client.post("/order/add/"+ self.user.userid, json={ "userid":"8888",
+                    "firstname":"Eric",
+                    "lastname": "Cartman",
+                    "address":{
+                        "street":"20 Riding Lane Av",
+                        "city":"San Francisco",
+                        "zip":"10201",
+                        "state": "CA",
+                        "country":"USA"},
+                    "email":"jblaze@marvel.com",
+                    "delivery":"UPS/FEDEX",
+                    "card":{
+                        "type":"amex/visa/mastercard/bahubali",
+                        "number":"349834797981", 
+                        "expMonth":"12",
+                        "expYear": "2022",
+                        "ccv":"123"
+                    },
+                    "cart":[
+                        {"id":"1234", "description":"redpants", "quantity":"1", "price":"4"},
+                        {"id":"5678", "description":"bluepants", "quantity":"1", "price":"4"}
+                    ],
+                    "total":"100"})
+
+        def listCatalogItems(self):
+            items = self.client.get("/products").json()["data"]
+            for item in items:
+                products.append(item["id"])
+            return products
+
+        @task(2)
+        def index(self):
+            self.client.get("/")
+
+
+    class UserBehavior(TaskSet):
+        tasks = {AuthUserBrowsing:2, GuestUserBrowsing:1}
+
+
+    class WebSiteUser(HttpUser):
+        tasks = [UserBehavior]
+        userid = ""
+        wait_time = between(0.5, 3)
+
+
+    class StagesShape(LoadTestShape):
+        total_runtime = 1200
+        stages = [
+            {"duration": 10, "users": 20, "spawn_rate": 5},
+            {"duration": 150, "users": 50, "spawn_rate": 2},
+            {"duration": 300, "users": 100, "spawn_rate": 5},
+            {"duration": 450, "users": 150, "spawn_rate": 5},
+            {"duration": 600, "users": 600, "spawn_rate": 50},
+            {"duration": 750, "users": 400, "spawn_rate": 5},
+            {"duration": 900, "users": 300, "spawn_rate": 1},
+            {"duration": 1050, "users": 100, "spawn_rate": 5},
+            {"duration": 1200, "users": 50, "spawn_rate": 1},
+        ]
+
+        def tick(self):
+            run_time = self.get_run_time() % self.total_runtime
+
+            for stage in self.stages:
+                if run_time < stage["duration"]:
+                    return (stage["users"], stage["spawn_rate"])
+
+            return None
